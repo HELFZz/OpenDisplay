@@ -1,0 +1,20 @@
+name: Build driver and test app
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-sign-off:
+    uses: ./.github/workflows/msbuild.yml
+    with:
+      sign-mode: "off"
+      upload-tag: "build_github_ci_sign_off"
+
+  build-test-sign:
+    uses: ./.github/workflows/msbuild.yml
+    with:
+      sign-mode: "Test Sign"
+      upload-tag: "build_github_ci_test_sign"

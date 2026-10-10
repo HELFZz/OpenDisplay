@@ -1,0 +1,39 @@
+# Build outputs
+bin/
+obj/
+build/
+x64/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.log
+driver/packages/
+driver/x64/
+driver/Debug/
+driver/Release/
+control_panel/bin/
+host/bin/
+android/app/build/
+android/.gradle/
+android/local.properties
+android/build/
+
+# VS
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Tools (downloaded locally)
+tools/
+
+# Third-party build artifacts
+third_party/nv-codec-headers/build/
+
+# Temp
+*.tmp
+*.temp
+stdout.txt
+stderr.txt

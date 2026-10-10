@@ -1,0 +1,99 @@
+name: Build driver
+
+on:
+  workflow_call:
+    inputs:
+      sign-mode:
+        type: string
+        default: "Test Sign"
+      upload-tag:
+          type: string
+          default: "build_github_ci_test_sign"
+
+env:
+  Solution_Path: RustDeskIddDriver.sln
+  Project_Driver: ./RustDeskIddDriver/RustDeskIddDriver.vcxproj
+  Project_App: ./RustDeskIddApp/RustDeskIddApp.vcxproj
+
+jobs:
+  build-windows-test-sign:
+    runs-on: ${{ matrix.target }}
+    strategy:
+        fail-fast: false
+        matrix:
+          target: [windows-2022]
+          configuration: [Release]
+          platform: [x64]
+    env:
+      Dist_Dir: RustDeskIddDriver_${{ matrix.platform }}
+      Dist_File: RustDeskIddDriver_${{ matrix.platform }}.zip
+      Driver_Output_Dir: ./RustDeskIddDriver/${{ matrix.platform }}/${{ matrix.configuration }}
+      App_Output_Dir: ./RustDeskIddApp/${{ matrix.platform }}/${{ matrix.configuration }}
+      Configuration: ${{ matrix.configuration }}
+      Platform: ${{ matrix.platform }}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Try build driver test sign
+        if: inputs.sign-mode == 'Test Sign'
+        run: |
+          msbuild ${{ env.Project_Driver }} -p:Configuration=${{ env.Configuration }} -p:Platform=${{ env.Platform }} /p:TargetVersion=Windows10
+
+      - name: Try build driver sign off
+        if: inputs.sign-mode == 'off'
+        run: |
+          msbuild ${{ env.Project_Driver }} -p:Configuration=${{ env.Configuration }} -p:Platform=${{ env.Platform }} /p:TargetVersion=Windows10 /p:SignMode=off
+
+      - name: Build demo app
+        run: |
+          msbuild ${{ env.Project_App }} -p:Configuration=${{ env.Configuration }} -p:Platform=${{ env.Platform }} /p:TargetVersion=Windows10
+
+    #   - name: Sign driver
+    #     uses: GermanBluefox/code-sign-action@v7
+    #     if: inputs.sign-mode == 'off'
+    #     with:
+    #       certificate: '${{ secrets.WINDOWS_PFX_BASE64 }}'
+    #       password: '${{ secrets.WINDOWS_PFX_PASSWORD }}'
+    #       certificatesha1: '${{ secrets.WINDOWS_PFX_SHA1_THUMBPRINT }}'
+    #       folder: ./RustDeskIddDriver/${{ matrix.platform }}/${{ matrix.configuration }}
+    #       recursive: false
+
+      - name: Create dist dir
+        run: |
+          mkdir -p ${{ env.Dist_Dir }}
+
+      - name: Copy cert file if test sign
+        if: inputs.sign-mode == 'Test Sign'
+        run: |
+          mv ./${{ env.Driver_Output_Dir }}/RustDeskIddDriver.cer ${{ env.Dist_Dir }}
+
+      - name: Zip files
+        run: |
+          mv ./${{ env.Driver_Output_Dir }}/RustDeskIddDriver ${{ env.Dist_Dir }}
+          mv ./${{ env.App_Output_Dir }}/RustDeskIddApp.exe ${{ env.Dist_Dir }}
+          mv ./RustDeskIddApp/README.md ${{ env.Dist_Dir }}
+
+          $vcruntime140 = vswhere -latest -requires Microsoft.Component.MSBuild -find VC\Tools\**\bin\HostX64\x64\vcruntime140.dll
+          copy $vcruntime140[-1] ${{ env.dist_dir }}
+          $installPath = vswhere -latest -requires Microsoft.Component.MSBuild -property installationPath
+          copy $installPath/Common7/IDE/ucrtbase.dll ${{ env.dist_dir }}
+
+          Get-ChildItem ${{ env.Dist_Dir }} -Recurse -File | ForEach-Object {$filePath = $_.FullName; Write-Output "$($(Get-FileHash -Algorithm SHA256 -Path $filePath).Hash) $filePath" }
+          Compress-Archive -Path ${{ env.Dist_Dir }}/* -Destination ${{ env.Dist_File }}
+          md5sum ${{ env.Dist_File }} | tee ${{ env.Dist_File }}.checksum_md5
+          sha256sum ${{ env.Dist_File }} | tee  ${{ env.Dist_File }}.checksum_sha256
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v1
+        if: always()
+        with:
+          prerelease: true
+          tag_name: ${{ inputs.upload-tag }}
+          files: |
+            ${{ env.DIST_FILE }}
+            ${{ env.DIST_FILE }}.checksum_md5
+            ${{ env.DIST_FILE }}.checksum_sha256
