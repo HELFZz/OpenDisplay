@@ -84,6 +84,22 @@ bool NvencEncoder::init(ID3D11Device* srcDevice, uint32_t width, uint32_t height
     if (!createNvidiaDevice(err))
         return false;
 
+    // Check if source is already on NVIDIA (skip cross-adapter copy)
+    Microsoft::WRL::ComPtr<IDXGIDevice> srcDxgi;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> srcAdapter;
+    Microsoft::WRL::ComPtr<IDXGIDevice> nvDxgi;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> nvAdapter;
+    if (SUCCEEDED(srcDevice->QueryInterface(IID_PPV_ARGS(&srcDxgi))) && SUCCEEDED(srcDxgi->GetAdapter(&srcAdapter)) &&
+        SUCCEEDED(m_device.As(&nvDxgi)) && SUCCEEDED(nvDxgi->GetAdapter(&nvAdapter))) {
+        DXGI_ADAPTER_DESC srcDesc = {}, nvDesc = {};
+        srcAdapter->GetDesc(&srcDesc);
+        nvAdapter->GetDesc(&nvDesc);
+        if (srcDesc.AdapterLuid.HighPart == nvDesc.AdapterLuid.HighPart &&
+            srcDesc.AdapterLuid.LowPart == nvDesc.AdapterLuid.LowPart) {
+            m_sameAdapter = true;
+        }
+    }
+
     m_dll = LoadLibraryW(L"nvEncodeAPI64.dll");
     if (!m_dll) {
         err = L"nvEncodeAPI64.dll not found";
@@ -236,91 +252,116 @@ bool NvencEncoder::encode(ID3D11Texture2D* bgraTex, bool forceIdr,
     InputSurface& in = m_inputs[m_nextInput];
     m_nextInput = (m_nextInput + 1) % m_inputs.size();
 
-    // Cross-adapter copy: try GPU shared texture first, fall back to CPU staging
-    if (!m_shared) {
-        D3D11_TEXTURE2D_DESC sd = {};
-        bgraTex->GetDesc(&sd);
+    ID3D11Texture2D* nvTex = nullptr;
 
-        // Create shared texture on source device
-        sd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-        sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        sd.Usage = D3D11_USAGE_DEFAULT;
-        sd.CPUAccessFlags = 0;
-        if (SUCCEEDED(m_srcDevice->CreateTexture2D(&sd, nullptr, &m_shared))) {
-            // Open shared handle on NVIDIA device
-            Microsoft::WRL::ComPtr<IDXGIResource> dxgiRes;
-            if (SUCCEEDED(m_shared.As(&dxgiRes)) &&
-                SUCCEEDED(dxgiRes->GetSharedHandle(&m_sharedHandle)) && m_sharedHandle) {
-                D3D11_TEXTURE2D_DESC nd = sd;
-                nd.MiscFlags = 0;
-                nd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-                if (SUCCEEDED(m_device->OpenSharedResource(m_sharedHandle, IID_PPV_ARGS(&m_sharedNv)))) {
-                    m_useShared = true;
+    if (m_sameAdapter) {
+        // Same GPU — use source texture directly, no copy needed
+        nvTex = bgraTex;
+    } else {
+        // Cross-adapter: init shared texture once
+        if (!m_shared && !m_staging) {
+            D3D11_TEXTURE2D_DESC sd = {};
+            bgraTex->GetDesc(&sd);
+
+            // Try shared texture with keyed mutex for GPU sync
+            sd.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+            sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            sd.Usage = D3D11_USAGE_DEFAULT;
+            sd.CPUAccessFlags = 0;
+            if (SUCCEEDED(m_srcDevice->CreateTexture2D(&sd, nullptr, &m_shared))) {
+                Microsoft::WRL::ComPtr<IDXGIResource> dxgiRes;
+                if (SUCCEEDED(m_shared.As(&dxgiRes)) &&
+                    SUCCEEDED(dxgiRes->GetSharedHandle(&m_sharedHandle)) && m_sharedHandle) {
+                    D3D11_TEXTURE2D_DESC nd = sd;
+                    nd.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+                    nd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                    if (SUCCEEDED(m_device->OpenSharedResource(m_sharedHandle, IID_PPV_ARGS(&m_sharedNv)))) {
+                        m_sharedNv.As(&m_sharedKeyedMutex);
+                        m_useShared = m_sharedKeyedMutex != nullptr;
+                    }
+                }
+            }
+
+            if (!m_useShared) {
+                // Fallback: CPU staging
+                m_shared.Reset();
+                m_sharedNv.Reset();
+                sd.MiscFlags = 0;
+                sd.Usage = D3D11_USAGE_STAGING;
+                sd.BindFlags = 0;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                if (FAILED(m_srcDevice->CreateTexture2D(&sd, nullptr, &m_staging))) {
+                    err = L"CreateTexture2D(staging) failed";
+                    return false;
+                }
+                D3D11_TEXTURE2D_DESC ud = {};
+                bgraTex->GetDesc(&ud);
+                ud.Usage = D3D11_USAGE_DEFAULT;
+                ud.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                ud.CPUAccessFlags = 0;
+                ud.MiscFlags = 0;
+                if (FAILED(m_device->CreateTexture2D(&ud, nullptr, &m_upload))) {
+                    err = L"CreateTexture2D(upload) failed";
+                    return false;
                 }
             }
         }
 
-        if (!m_useShared) {
-            // Fallback: CPU staging
-            sd.MiscFlags = 0;
-            sd.Usage = D3D11_USAGE_STAGING;
-            sd.BindFlags = 0;
-            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            if (FAILED(m_srcDevice->CreateTexture2D(&sd, nullptr, &m_staging))) {
-                err = L"CreateTexture2D(staging) failed";
+        if (m_useShared) {
+            // Acquire keyed mutex on source, copy, release
+            if (m_sharedKeyedMutex)
+                m_sharedKeyedMutex->AcquireSync(0, INFINITE);
+            m_srcCtx->CopyResource(m_shared.Get(), bgraTex);
+            if (m_sharedKeyedMutex)
+                m_sharedKeyedMutex->ReleaseSync(1);
+            // Acquire on NVIDIA side, encode, release
+            if (m_sharedKeyedMutex)
+                m_sharedKeyedMutex->AcquireSync(1, INFINITE);
+            nvTex = m_sharedNv.Get();
+        } else {
+            // CPU fallback (should not normally hit if shared works)
+            m_srcCtx->CopyResource(m_staging.Get(), bgraTex);
+            m_srcCtx->Flush();
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            if (FAILED(m_srcCtx->Map(m_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                err = L"Map(staging) failed";
                 return false;
             }
-            D3D11_TEXTURE2D_DESC ud = {};
-            bgraTex->GetDesc(&ud);
-            ud.Usage = D3D11_USAGE_DEFAULT;
-            ud.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            ud.CPUAccessFlags = 0;
-            ud.MiscFlags = 0;
-            if (FAILED(m_device->CreateTexture2D(&ud, nullptr, &m_upload))) {
-                err = L"CreateTexture2D(upload) failed";
-                return false;
-            }
+            m_ctx->UpdateSubresource(m_upload.Get(), 0, nullptr, mapped.pData, mapped.RowPitch, 0);
+            m_srcCtx->Unmap(m_staging.Get(), 0);
+            nvTex = m_upload.Get();
         }
     }
 
-    ID3D11Texture2D* nvTex = nullptr;
-    if (m_useShared) {
-        // GPU copy: src -> shared -> NVIDIA device
-        m_srcCtx->CopyResource(m_shared.Get(), bgraTex);
-        m_srcCtx->Flush();
-        nvTex = m_sharedNv.Get();
-    } else {
-        // CPU fallback
-        m_srcCtx->CopyResource(m_staging.Get(), bgraTex);
-        m_srcCtx->Flush();
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        if (FAILED(m_srcCtx->Map(m_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-            err = L"Map(staging) failed";
+    // Cache video processor views (avoid recreating every frame)
+    size_t inSlot = m_nextInput % 4;
+    size_t outSlot = m_nextInput % 4;
+
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inView = m_cachedInViews[inSlot];
+    if (!inView || m_cachedInTex[inSlot] != nvTex) {
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
+        ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        ivd.Texture2D.MipSlice = 0;
+        ivd.Texture2D.ArraySlice = 0;
+        if (FAILED(m_videoDevice->CreateVideoProcessorInputView(nvTex, m_venum.Get(), &ivd, &inView))) {
+            err = L"CreateVideoProcessorInputView failed";
             return false;
         }
-        m_ctx->UpdateSubresource(m_upload.Get(), 0, nullptr, mapped.pData, mapped.RowPitch, 0);
-        m_srcCtx->Unmap(m_staging.Get(), 0);
-        nvTex = m_upload.Get();
+        m_cachedInViews[inSlot] = inView;
+        m_cachedInTex[inSlot] = nvTex;
     }
 
-    // BGRA -> NV12 into this input surface
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inView;
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
-    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    ivd.Texture2D.MipSlice = 0;
-    ivd.Texture2D.ArraySlice = 0;
-    if (FAILED(m_videoDevice->CreateVideoProcessorInputView(nvTex, m_venum.Get(), &ivd, &inView))) {
-        err = L"CreateVideoProcessorInputView failed";
-        return false;
-    }
-
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> outView;
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
-    ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    ovd.Texture2D.MipSlice = 0;
-    if (FAILED(m_videoDevice->CreateVideoProcessorOutputView(in.tex.Get(), m_venum.Get(), &ovd, &outView))) {
-        err = L"CreateVideoProcessorOutputView failed";
-        return false;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> outView = m_cachedOutViews[outSlot];
+    if (!outView || m_cachedOutTex[outSlot] != in.tex.Get()) {
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
+        ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        ovd.Texture2D.MipSlice = 0;
+        if (FAILED(m_videoDevice->CreateVideoProcessorOutputView(in.tex.Get(), m_venum.Get(), &ovd, &outView))) {
+            err = L"CreateVideoProcessorOutputView failed";
+            return false;
+        }
+        m_cachedOutViews[outSlot] = outView;
+        m_cachedOutTex[outSlot] = in.tex.Get();
     }
 
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
@@ -330,6 +371,10 @@ bool NvencEncoder::encode(ID3D11Texture2D* bgraTex, bool forceIdr,
         err = L"VideoProcessorBlt failed";
         return false;
     }
+
+    // Release keyed mutex after conversion
+    if (m_useShared && m_sharedKeyedMutex)
+        m_sharedKeyedMutex->ReleaseSync(0);
 
     NV_ENC_MAP_INPUT_RESOURCE map = {};
     map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;

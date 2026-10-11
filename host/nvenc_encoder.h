@@ -1,5 +1,6 @@
 #pragma once
 #include <d3d11.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <vector>
 #include <cstdint>
@@ -40,16 +41,23 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_ctx;
 
-    // Staging texture for cross-adapter copy (on src device, CPU-readable)
+    // CPU staging fallback
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_staging;
-    // Staging texture on NVIDIA device (for upload)
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_upload;
 
-    // Shared GPU texture (src device -> NVIDIA device, no CPU copy)
+    // GPU shared texture (src -> NVIDIA, no CPU copy)
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_shared;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedNv;
+    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> m_sharedKeyedMutex;
     HANDLE m_sharedHandle = nullptr;
     bool m_useShared = false;
+    bool m_sameAdapter = false;
+
+    // Cached video processor views (avoid recreating every frame)
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> m_cachedInViews[4];
+    ID3D11Texture2D* m_cachedInTex[4] = {};
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_cachedOutViews[4];
+    ID3D11Texture2D* m_cachedOutTex[4] = {};
 
     NV_ENCODE_API_FUNCTION_LIST* m_api = nullptr;
     HMODULE m_dll = nullptr;

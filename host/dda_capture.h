@@ -25,9 +25,9 @@ public:
     uint32_t width() const { return m_width; }
     uint32_t height() const { return m_height; }
     ID3D11Device* device() const { return m_device.Get(); }
-
 private:
     void drawCursor(const CURSORINFO& ci, int cx, int cy);
+
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_ctx;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> m_dupl;
@@ -38,5 +38,13 @@ private:
     int m_outputLeft = 0, m_outputTop = 0;
     int m_lastCursorX = -9999, m_lastCursorY = -9999;
     HCURSOR m_lastCursorHandle = nullptr;
-    bool m_hasContent = false; // m_output has at least one full frame
+    bool m_hasContent = false;
+
+    // Cached cursor bitmap (re-render only when cursor shape changes)
+    HCURSOR m_cachedCursorIcon = nullptr;
+    void* m_cursorBits = nullptr;       // BGRA pixels
+    int m_cursorW = 0, m_cursorH = 0;
+    int m_cursorHotX = 0, m_cursorHotY = 0;
+    HBITMAP m_cursorDib = nullptr;
+    HDC m_cursorMemDC = nullptr;
 };

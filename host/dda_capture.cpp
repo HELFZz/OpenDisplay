@@ -9,6 +9,8 @@
 
 DdaCapture::~DdaCapture() {
     releaseFrame();
+    if (m_cursorDib) DeleteObject(m_cursorDib);
+    if (m_cursorMemDC) DeleteDC(m_cursorMemDC);
 }
 
 bool DdaCapture::init(uint32_t outputIndex, std::wstring& err) {
@@ -145,98 +147,118 @@ void DdaCapture::drawCursor(const CURSORINFO& ci, int cx, int cy) {
     m_lastCursorY = ci.ptScreenPos.y - m_outputTop;
     m_lastCursorHandle = ci.hCursor;
 
-    ICONINFO ii = {};
-    if (!GetIconInfo(ci.hCursor, &ii))
-        return;
-    const int hotX = (int)ii.xHotspot;
-    const int hotY = (int)ii.yHotspot;
+    // Re-render cursor bitmap only when cursor shape changes
+    if (ci.hCursor != m_cachedCursorIcon) {
+        m_cachedCursorIcon = ci.hCursor;
 
-    BITMAP bmColor = {}, bmMask = {};
-    GetObject(ii.hbmColor, sizeof(bmColor), &bmColor);
-    GetObject(ii.hbmMask, sizeof(bmMask), &bmMask);
-    int cw = bmColor.bmWidth ? bmColor.bmWidth : bmMask.bmWidth / 2;
-    int ch = bmColor.bmHeight ? bmColor.bmHeight : bmMask.bmHeight / 2;
-    if (ii.hbmMask) DeleteObject(ii.hbmMask);
-    if (ii.hbmColor) DeleteObject(ii.hbmColor);
-    if (cw <= 0 || ch <= 0) return;
+        ICONINFO ii = {};
+        if (!GetIconInfo(ci.hCursor, &ii))
+            return;
 
-    int px = cx - hotX;
-    int py = cy - hotY;
+        BITMAP bmColor = {}, bmMask = {};
+        GetObject(ii.hbmColor, sizeof(bmColor), &bmColor);
+        GetObject(ii.hbmMask, sizeof(bmMask), &bmMask);
+        m_cursorW = bmColor.bmWidth ? bmColor.bmWidth : bmMask.bmWidth / 2;
+        m_cursorH = bmColor.bmHeight ? bmColor.bmHeight : bmMask.bmHeight / 2;
+        m_cursorHotX = (int)ii.xHotspot;
+        m_cursorHotY = (int)ii.yHotspot;
+        if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+
+        if (m_cursorW <= 0 || m_cursorH <= 0) return;
+
+        // Create cached DIB and render cursor into it
+        if (m_cursorDib) { DeleteObject(m_cursorDib); m_cursorDib = nullptr; }
+        if (!m_cursorMemDC) {
+            HDC screen = GetDC(nullptr);
+            m_cursorMemDC = CreateCompatibleDC(screen);
+            ReleaseDC(nullptr, screen);
+        }
+
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = m_cursorW;
+        bmi.bmiHeader.biHeight = -m_cursorH; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        m_cursorDib = CreateDIBSection(m_cursorMemDC, &bmi, DIB_RGB_COLORS, &m_cursorBits, nullptr, 0);
+        if (!m_cursorDib || !m_cursorBits) return;
+
+        memset(m_cursorBits, 0, (size_t)m_cursorW * m_cursorH * 4);
+        HGDIOBJ old = SelectObject(m_cursorMemDC, m_cursorDib);
+        DrawIconEx(m_cursorMemDC, 0, 0, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+        SelectObject(m_cursorMemDC, old);
+    }
+
+    if (!m_cursorBits) return;
+
+    int px = cx - m_cursorHotX;
+    int py = cy - m_cursorHotY;
 
     // Clip cursor rect to output
     int sx = 0, sy = 0;
+    int cw = m_cursorW, ch = m_cursorH;
     if (px < 0) { sx = -px; cw += px; px = 0; }
     if (py < 0) { sy = -py; ch += py; py = 0; }
     if (px + cw > (int)m_width)  cw = (int)m_width - px;
     if (py + ch > (int)m_height) ch = (int)m_height - py;
     if (cw <= 0 || ch <= 0) return;
 
-    // Render cursor into small top-down 32bpp DIB
-    int fullW = bmColor.bmWidth ? bmColor.bmWidth : bmMask.bmWidth / 2;
-    int fullH = bmColor.bmHeight ? bmColor.bmHeight : bmMask.bmHeight / 2;
-    HDC screen = GetDC(nullptr);
-    HDC mem = CreateCompatibleDC(screen);
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = fullW;
-    bmi.bmiHeader.biHeight = -fullH;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP bmp = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (bmp && bits) {
-        memset(bits, 0, (size_t)fullW * fullH * 4);
-        HGDIOBJ old = SelectObject(mem, bmp);
-        DrawIconEx(mem, 0, 0, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
-        SelectObject(mem, old);
+    // Use small staging texture sized to cursor (not full frame)
+    if (!m_cursorStaging) {
+        D3D11_TEXTURE2D_DESC sd = {};
+        sd.Width = m_cursorW;
+        sd.Height = m_cursorH;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+        m_device->CreateTexture2D(&sd, nullptr, &m_cursorStaging);
+    }
+    if (!m_cursorStaging) return;
 
-        if (!m_cursorStaging) {
-            D3D11_TEXTURE2D_DESC sd = {};
-            m_output->GetDesc(&sd);
-            sd.Usage = D3D11_USAGE_STAGING;
-            sd.BindFlags = 0;
-            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
-            m_device->CreateTexture2D(&sd, nullptr, &m_cursorStaging);
-        }
-        if (m_cursorStaging) {
-            // Sync staging with current output
-            m_ctx->CopyResource(m_cursorStaging.Get(), m_output.Get());
-            m_ctx->Flush();
+    // Copy the small cursor region from output to staging (GPU)
+    // Source: output at (px, py), size (cw, ch) -> staging at (0, 0)
+    D3D11_BOX srcBox = { (UINT)px, (UINT)py, 0, (UINT)(px + cw), (UINT)(py + ch), 1 };
+    m_ctx->CopySubresourceRegion(m_cursorStaging.Get(), 0,
+                                 0, 0, 0,
+                                 m_output.Get(), 0, &srcBox);
+    m_ctx->Flush();
 
-            D3D11_MAPPED_SUBRESOURCE mr = {};
-            if (SUCCEEDED(m_ctx->Map(m_cursorStaging.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mr))) {
-                for (int y = 0; y < ch; y++) {
-                    const uint8_t* srow = (const uint8_t*)bits + (size_t)(sy + y) * fullW * 4;
-                    uint8_t* drow = (uint8_t*)mr.pData + (size_t)(py + y) * mr.RowPitch;
-                    for (int x = 0; x < cw; x++) {
-                        const uint8_t* s = srow + (size_t)(sx + x) * 4;
-                        uint8_t a = s[3];
-                        if (a == 0) continue;
-                        uint8_t* d = drow + (size_t)(px + x) * 4;
-                        if (a == 255) {
-                            d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
-                        } else {
-                            // alpha blend over dest (GDI is premultiplied)
-                            d[0] = (uint8_t)(s[0] + d[0] * (255 - a) / 255);
-                            d[1] = (uint8_t)(s[1] + d[1] * (255 - a) / 255);
-                            d[2] = (uint8_t)(s[2] + d[2] * (255 - a) / 255);
-                        }
-                        d[3] = 255;
-                    }
+    // Alpha blend cursor over the small region (CPU, fast — only ~32x32 pixels)
+    D3D11_MAPPED_SUBRESOURCE mr = {};
+    if (SUCCEEDED(m_ctx->Map(m_cursorStaging.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mr))) {
+        for (int y = 0; y < ch; y++) {
+            const uint8_t* srow = (const uint8_t*)m_cursorBits + (size_t)(sy + y) * m_cursorW * 4;
+            uint8_t* drow = (uint8_t*)mr.pData + (size_t)y * mr.RowPitch;
+            for (int x = 0; x < cw; x++) {
+                const uint8_t* s = srow + (size_t)(sx + x) * 4;
+                uint8_t a = s[3];
+                if (a == 0) continue;
+                uint8_t* d = drow + (size_t)x * 4;
+                if (a == 255) {
+                    d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
+                } else {
+                    // Premultiplied alpha blend (GDI outputs premultiplied)
+                    d[0] = (uint8_t)(s[0] + d[0] * (255 - a) / 255);
+                    d[1] = (uint8_t)(s[1] + d[1] * (255 - a) / 255);
+                    d[2] = (uint8_t)(s[2] + d[2] * (255 - a) / 255);
                 }
-                m_ctx->Unmap(m_cursorStaging.Get(), 0);
-                D3D11_BOX box = { (UINT)px, (UINT)py, 0,
-                                  (UINT)(px + cw), (UINT)(py + ch), 1 };
-                m_ctx->CopySubresourceRegion(m_output.Get(), 0,
-                                             (UINT)px, (UINT)py, 0,
-                                             m_cursorStaging.Get(), 0, &box);
+                d[3] = 255;
             }
         }
-        DeleteObject(bmp);
+        m_ctx->Unmap(m_cursorStaging.Get(), 0);
+        // Copy blended region back to output (GPU)
+        // Source: staging at (0, 0), size (cw, ch) -> output at (px, py)
+        D3D11_BOX dstBox = { 0, 0, 0, (UINT)cw, (UINT)ch, 1 };
+        m_ctx->CopySubresourceRegion(m_output.Get(), 0,
+                                     (UINT)px, (UINT)py, 0,
+                                     m_cursorStaging.Get(), 0, &dstBox);
     }
-    DeleteDC(mem);
-    ReleaseDC(nullptr, screen);
 }
 
 void DdaCapture::releaseFrame() {
