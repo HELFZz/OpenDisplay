@@ -1,11 +1,14 @@
 #include <initguid.h>
 #include "virtual_display.h"
+#include "log.h"
 #include <dxgi1_6.h>
 #include <cfgmgr32.h>
 #include <setupapi.h>
 #include <cstdio>
+#include <vector>
 
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "user32.lib")
 
 VirtualDisplay::~VirtualDisplay() { close(); }
 
@@ -150,20 +153,33 @@ int VirtualDisplay::findNewOutput(uint32_t expectedW, uint32_t expectedH, int pr
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || !factory) return -1;
 
+    struct OutInfo { int idx; int w, h; uint32_t hz; bool attached; int left, top; };
+    std::vector<OutInfo> outputs;
     int idx = 0;
-    int found = -1;
     IDXGIAdapter1* adapter = nullptr;
     for (UINT a = 0; factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; a++) {
         IDXGIOutput* output = nullptr;
         for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; o++) {
             DXGI_OUTPUT_DESC desc{};
             output->GetDesc(&desc);
-            int w = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
-            int h = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
-
-            if (expectedW > 0 && (uint32_t)w == expectedW && (uint32_t)h == expectedH) {
-                found = idx;
+            uint32_t hz = 0;
+            IDXGIOutput1* out1 = nullptr;
+            if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&out1))) && out1) {
+                DXGI_MODE_DESC md = {};
+                md.Width = (UINT)(desc.DesktopCoordinates.right - desc.DesktopCoordinates.left);
+                md.Height = (UINT)(desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top);
+                md.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                DXGI_MODE_DESC matched = {};
+                if (SUCCEEDED(out1->FindClosestMatchingMode(&md, &matched, nullptr)) &&
+                    matched.RefreshRate.Denominator)
+                    hz = matched.RefreshRate.Numerator / matched.RefreshRate.Denominator;
+                out1->Release();
             }
+            outputs.push_back({ idx,
+                (int)(desc.DesktopCoordinates.right - desc.DesktopCoordinates.left),
+                (int)(desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top),
+                hz, desc.AttachedToDesktop != FALSE,
+                desc.DesktopCoordinates.left, desc.DesktopCoordinates.top });
             idx++;
             output->Release();
         }
@@ -171,6 +187,71 @@ int VirtualDisplay::findNewOutput(uint32_t expectedW, uint32_t expectedH, int pr
     }
     factory->Release();
 
-    if (found < 0 && idx > prevCount) found = idx - 1;
-    return found;
+    // Log all outputs for debugging
+    for (auto& o : outputs) {
+        log("[vd] output %d: %dx%d @%uHz attached=%d pos=(%d,%d)\n",
+            o.idx, o.w, o.h, o.hz, (int)o.attached, o.left, o.top);
+    }
+
+    log("[vd] GetDisplayConfig-free: %d outputs\n", (int)outputs.size());
+
+    // Strategy 0: if count increased, the new output is at index prevCount
+    if (prevCount >= 0 && (int)outputs.size() > prevCount) {
+        for (auto& o : outputs) {
+            if (o.idx == prevCount) {
+                log("[vd] new output after plug-in: %d (%dx%d @%uHz pos=(%d,%d))\n",
+                    o.idx, o.w, o.h, o.hz, o.left, o.top);
+                return o.idx;
+            }
+        }
+    }
+
+    // Strategy 1: find output that is NOT at (0,0) — secondary/virtual display
+    int matchW = -1;
+    for (auto& o : outputs) {
+        if (expectedW > 0 && (uint32_t)o.w == expectedW && (uint32_t)o.h == expectedH) {
+            if (matchW < 0) matchW = o.idx;
+            // Prefer non-primary (not at 0,0)
+            if (o.left != 0 || o.top != 0) {
+                log("[vd] found secondary at output %d\n", o.idx);
+                return o.idx;
+            }
+        }
+    }
+    if (matchW >= 0) {
+        log("[vd] only primary match at output %d\n", matchW);
+        return matchW;
+    }
+
+    // Strategy 2: find any non-primary output
+    for (auto& o : outputs) {
+        if (o.left != 0 || o.top != 0) {
+            log("[vd] found non-primary at output %d\n", o.idx);
+            return o.idx;
+        }
+    }
+
+    return -1;
+}
+
+bool VirtualDisplay::enableConnectedDisplays(std::string& err)
+{
+    // GetDisplayConfig is not exported from user32.dll on this Windows build,
+    // but SetDisplayConfig IS. Use SDC_TOPOLOGY_EXTEND to enable all connected displays.
+    typedef LONG (WINAPI *SetDisplayConfig_t)(UINT32, const void*, UINT32, const void*, UINT32);
+    static HMODULE u32 = LoadLibraryW(L"user32.dll");
+    if (!u32) { err = "user32 load failed"; return false; }
+    auto SetDC_ = (SetDisplayConfig_t)GetProcAddress(u32, "SetDisplayConfig");
+    if (!SetDC_) { err = "SetDisplayConfig not found"; return false; }
+
+    // SDC_TOPOLOGY_EXTEND | SDC_APPLY = 0x4 | 0x80 = 0x84
+    // Do NOT use SDC_SAVE_TO_DATABASE — it persists bad topology across reboots
+    LONG rc = SetDC_(0, nullptr, 0, nullptr, 0x84);
+    log("[vd] SetDisplayConfig(TOPOLOGY_EXTEND) = %ld\n", rc);
+    if (rc != ERROR_SUCCESS) {
+        err = "SetDisplayConfig failed: " + std::to_string(rc);
+        return false;
+    }
+    log("[vd] displays enabled\n");
+    return true;
 }

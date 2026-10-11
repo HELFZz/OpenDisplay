@@ -70,6 +70,13 @@ public:
     static int findNewOutput(uint32_t expectedW, uint32_t expectedH, int prevCount);
     static int countOutputs();
 
+    // Programmatically enable a connected-but-inactive display via SetDisplayConfig.
+    // Call after plugIn so Windows extends the desktop onto the virtual monitor.
+    static bool enableConnectedDisplays(std::string& err);
+
+    // Set a specific resolution/refresh on a DXGI output index via ChangeDisplaySettingsEx.
+    static bool setOutputMode(int dxgiIdx, uint32_t w, uint32_t h, uint32_t hz, std::string& err);
+
 private:
     HANDLE m_handle = INVALID_HANDLE_VALUE;
 };

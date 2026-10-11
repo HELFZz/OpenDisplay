@@ -1,20 +1,25 @@
 #include <windows.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdarg.h>
 
 #include <atomic>
 #include <thread>
 #include <string>
+#include <vector>
 
 #include "server.h"
 #include "dda_capture.h"
 #include "nvenc_encoder.h"
 #include "input.h"
 #include "virtual_display.h"
+#include "log.h"
 
-namespace {
+#define WM_TRAYICON (WM_USER + 1)
+#define ID_TRAY_EXIT 1001
+#define ID_TRAY_LOG  1002
 
-std::atomic<bool> g_running{true};
+// Shared log state
 FILE* g_logFile = nullptr;
 
 // Log to both stdout and file
@@ -32,6 +37,12 @@ void log(const char* fmt, ...) {
         fflush(g_logFile);
     }
 }
+
+namespace {
+
+std::atomic<bool> g_running{true};
+HWND g_hwnd = nullptr;
+std::wstring g_exeDir;
 
 // Find DXGI output index matching w×h (first match), or -1.
 int findOutputBySize(uint32_t w, uint32_t h) {
@@ -162,9 +173,91 @@ bool setupAdb(uint16_t port) {
     return true;
 }
 
+// --- Tray icon ---
+NOTIFYICONDATAW g_nid = {};
+
+void showTrayMenu() {
+    POINT pt;
+    GetCursorPos(&pt);
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, ID_TRAY_LOG, L"Open log");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Exit");
+    SetForegroundWindow(g_hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, nullptr);
+    DestroyMenu(menu);
+}
+
+LRESULT CALLBACK trayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_TRAYICON:
+        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU)
+            showTrayMenu();
+        else if (lParam == WM_LBUTTONDBLCLK) {
+            wchar_t logPath[MAX_PATH];
+            swprintf_s(logPath, L"%s\\host.log", g_exeDir.c_str());
+            ShellExecuteW(nullptr, L"open", logPath, nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_TRAY_EXIT:
+            g_running = false;
+            PostQuitMessage(0);
+            return 0;
+        case ID_TRAY_LOG: {
+            wchar_t logPath[MAX_PATH];
+            swprintf_s(logPath, L"%s\\host.log", g_exeDir.c_str());
+            ShellExecuteW(nullptr, L"open", logPath, nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
+        }
+        }
+        break;
+    case WM_DESTROY:
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void setupTray(HINSTANCE hInst) {
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = trayWndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"OpenDisplayHostTray";
+    RegisterClassExW(&wc);
+
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0,
+                              HWND_MESSAGE, nullptr, hInst, nullptr);
+
+    g_nid = {};
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = g_hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(g_nid.szTip, L"OpenDisplay Host");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+}
+
 } // namespace
 
-int main(int argc, char** argv) {
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    // Convert command line to argc/argv
+    int argc = 0;
+    LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::vector<std::string> args(argc);
+    std::vector<char*> argv(argc);
+    for (int i = 0; i < argc; i++) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, nullptr, 0, nullptr, nullptr);
+        args[i].resize(len - 1);
+        WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, args[i].data(), len, nullptr, nullptr);
+        argv[i] = args[i].data();
+    }
+    LocalFree(argvW);
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
 
@@ -173,8 +266,20 @@ int main(int argc, char** argv) {
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     std::wstring exeDir(exePath);
     exeDir = exeDir.substr(0, exeDir.find_last_of(L'\\'));
+    g_exeDir = exeDir;
     std::wstring logPath = exeDir + L"\\host.log";
     g_logFile = _wfsopen(logPath.c_str(), L"w", _SH_DENYNO);
+
+    // Setup tray icon + message loop in background thread
+    setupTray(GetModuleHandleW(nullptr));
+    std::thread msgThread([] {
+        MSG msg;
+        while (GetMessageW(&msg, nullptr, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    });
+    msgThread.detach();
 
     uint16_t port = OD_PORT;
     uint32_t qp = 18;
@@ -192,7 +297,7 @@ int main(int argc, char** argv) {
             useVirtual = false;
     }
 
-    log("OpenDisplay host v1 (HEVC, port %u, qp %u)\n", port, qp);
+    log("OpenDisplay host v0.2beta (HEVC, port %u, qp %u)\n", port, qp);
 
     Server server;
     std::string err;
@@ -253,6 +358,16 @@ int main(int argc, char** argv) {
             log("[vd] driver not installed — using existing display\n");
             useVirtual = false;
         } else {
+            // Unplug first if already plugged (error 123 = already exists)
+            std::string perr;
+            if (vdisplay.plugOut(0, perr)) {
+                log("[vd] unplugged old monitor\n");
+                Sleep(500);
+            }
+            // Re-count AFTER unplug — this is the true baseline
+            prevCount = VirtualDisplay::countOutputs();
+            log("[vd] outputs after unplug: %d\n", prevCount);
+
             if (!vdisplay.plugIn(0, 2, verr)) {
                 log("[vd] plugIn failed: %s\n", verr.c_str());
                 useVirtual = false;
@@ -270,14 +385,59 @@ int main(int argc, char** argv) {
                 log("[vd] virtual monitor plugged in (connector 0, %ux%u@%u)\n",
                     modeW, modeH, modeHz);
 
-                Sleep(2000);
+                // Programmatically enable the display so DXGI can see it
+                std::string enerr;
+                if (VirtualDisplay::enableConnectedDisplays(enerr)) {
+                    log("[vd] display enabled via SetDisplayConfig\n");
+                } else {
+                    log("[vd] enableConnectedDisplays: %s\n", enerr.c_str());
+                }
+
+                Sleep(3000);
 
                 int newIdx = VirtualDisplay::findNewOutput(modeW, modeH, prevCount);
                 if (newIdx >= 0) {
                     displayIdx = newIdx;
                     log("[vd] found virtual display at output index %d\n", newIdx);
+
+                    // Set correct resolution via DXGI output description → device name
+                    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+                    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+                        int idx = 0;
+                        for (UINT a = 0; ; ++a) {
+                            Microsoft::WRL::ComPtr<IDXGIAdapter> ad;
+                            if (factory->EnumAdapters(a, &ad) == DXGI_ERROR_NOT_FOUND) break;
+                            for (UINT o = 0; ; ++o) {
+                                Microsoft::WRL::ComPtr<IDXGIOutput> out;
+                                if (ad->EnumOutputs(o, &out) == DXGI_ERROR_NOT_FOUND) break;
+                                if (idx == newIdx) {
+                                    DXGI_OUTPUT_DESC od = {};
+                                    out->GetDesc(&od);
+                                    log("[vd] setting %ls to %ux%u@%u\n",
+                                        od.DeviceName, modeW, modeH, modeHz);
+                                    DEVMODEW dm = {};
+                                    dm.dmSize = sizeof(dm);
+                                    dm.dmPelsWidth = modeW;
+                                    dm.dmPelsHeight = modeH;
+                                    dm.dmDisplayFrequency = modeHz;
+                                    dm.dmBitsPerPel = 32;
+                                    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT |
+                                                   DM_DISPLAYFREQUENCY | DM_BITSPERPEL;
+                                    LONG rc = ChangeDisplaySettingsExW(od.DeviceName, &dm, nullptr,
+                                                                        CDS_UPDATEREGISTRY, nullptr);
+                                    log("[vd] ChangeDisplaySettingsEx = %ld\n", rc);
+                                    if (rc != DISP_CHANGE_SUCCESSFUL) {
+                                        rc = ChangeDisplaySettingsExW(od.DeviceName, &dm, nullptr, 0, nullptr);
+                                        log("[vd] ChangeDisplaySettingsEx(retry) = %ld\n", rc);
+                                    }
+                                }
+                                idx++;
+                            }
+                        }
+                    }
                 } else {
-                    log("[vd] could not find virtual display output\n");
+                    log("[vd] could not find virtual display, outputs now: %d\n",
+                        VirtualDisplay::countOutputs());
                 }
             }
         }
@@ -369,8 +529,18 @@ int main(int argc, char** argv) {
         std::string aerr;
         int r = dda.acquire(1000 / (modeHz * 2), &tex, werr);
         if (r < 0) {
-            log("[!] dda acquire failed\n");
-            break;
+            log("[!] dda acquire failed, reinitializing in 1s...\n");
+            dda.releaseFrame();
+            Sleep(1000);
+            std::wstring rerr;
+            if (!dda.init((uint32_t)displayIdx, rerr)) {
+                log("[!] dda reinit failed, retrying...\n");
+                Sleep(2000);
+                continue;
+            }
+            log("[+] dda reinit ok: %ux%u @%uHz\n", dda.width(), dda.height(), dda.refreshRate());
+            enc.requestSpsPps();
+            continue;
         }
         if (r == 0) {
             ++ddaTimeouts;
@@ -415,6 +585,12 @@ int main(int argc, char** argv) {
     if (control.joinable())
         control.join();
     log("[*] Stopped\n");
+    // Unplug virtual monitor on exit
+    if (useVirtual) {
+        std::string perr;
+        if (vdisplay.plugOut(0, perr))
+            log("[vd] virtual monitor unplugged\n");
+    }
     if (g_logFile) fclose(g_logFile);
     return 0;
 }
