@@ -2,16 +2,25 @@ package com.opendisplay.app
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Bundle
 import android.util.Log
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.WindowManager
-import android.widget.EditText
+import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.ScrollView
+import android.widget.Space
 import android.widget.TextView
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -21,11 +30,29 @@ import kotlin.concurrent.thread
 class MainActivity : Activity(), SurfaceHolder.Callback {
     companion object {
         private const val TAG = "OpenDisplay"
+        private const val VERSION = "0.2beta"
     }
 
+    // UI states
+    enum class State { DISCONNECTED, CONNECTING, CONNECTED, STREAMING, ERROR }
+
     private lateinit var surfaceView: SurfaceView
+    private lateinit var rootLayout: FrameLayout
+    private lateinit var uiLayer: FrameLayout
+    private lateinit var statusBar: LinearLayout
+
+    // UI elements
+    private lateinit var stateTitle: TextView
+    private lateinit var stateSubtitle: TextView
+    private lateinit var stateIcon: TextView
+    private lateinit var btnAction: Button
+    private lateinit var btnSettings: Button
+    private lateinit var progressBar: ProgressBar
+    private lateinit var statusText: TextView
+
     @Volatile private var surfaceReady = false
     @Volatile private var running = false
+    @Volatile private var currentState = State.DISCONNECTED
 
     private var socket: Socket? = null
     @Volatile private var out: DataOutputStream? = null
@@ -34,97 +61,504 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var videoW = 0
     private var videoH = 0
 
+    // Colors
+    private val bgColor = Color.parseColor("#1a1a2e")
+    private val cardColor = Color.parseColor("#16213e")
+    private val accentColor = Color.parseColor("#0f3460")
+    private val accentBright = Color.parseColor("#e94560")
+    private val textColor = Color.parseColor("#eaeaea")
+    private val textDim = Color.parseColor("#8899aa")
+    private val greenColor = Color.parseColor("#4ecca3")
+    private val yellowColor = Color.parseColor("#f9ed69")
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Read port from intent
         intent?.getIntExtra("port", -1)?.let { p ->
             if (p in 1..65535) Settings.setPort(this, p)
         }
 
-        surfaceView = SurfaceView(this)
-        surfaceView.holder.addCallback(this)
-        setContentView(surfaceView)
+        setupUI()
+    }
 
-        // Long-press to open settings
+    private fun setupUI() {
+        rootLayout = FrameLayout(this).apply { setBackgroundColor(bgColor) }
+
+        // SurfaceView for video
+        surfaceView = SurfaceView(this).apply {
+            holder.addCallback(this@MainActivity)
+            visibility = View.GONE
+        }
+        rootLayout.addView(surfaceView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+
+        // Status bar (visible during streaming)
+        statusBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#cc1a1a2e"))
+            setPadding(24, 12, 24, 12)
+            visibility = View.GONE
+        }
+        statusText = TextView(this).apply {
+            text = ""
+            setTextColor(textColor)
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+        }
+        statusBar.addView(statusText)
+        rootLayout.addView(statusBar, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply { gravity = Gravity.TOP })
+
+        // UI layer for menus
+        uiLayer = FrameLayout(this)
+        rootLayout.addView(uiLayer, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+
+        setContentView(rootLayout)
+
+        // Long-press on surface opens settings
         surfaceView.setOnLongClickListener {
-            showSettingsDialog()
+            showSettings()
             true
         }
+
+        showDisconnectedState()
     }
 
-    private fun showSettingsDialog() {
-        stopStream()
+    private fun showDisconnectedState() {
+        currentState = State.DISCONNECTED
+        uiLayer.visibility = View.VISIBLE
+        surfaceView.visibility = View.GONE
+        statusBar.visibility = View.GONE
+        uiLayer.removeAllViews()
 
-        val layout = LinearLayout(this).apply {
+        val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(48, 24, 48, 24)
+            gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            setPadding(48, 48, 48, 48)
         }
 
-        val fpsLabel = TextView(this).apply { text = "FPS: ${Settings.getFps(this@MainActivity)}" }
-        val fpsEdit = EditText(this).apply {
-            setText(Settings.getFps(this@MainActivity).toString())
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        // App icon / logo
+        stateIcon = TextView(this).apply {
+            text = "🖥"
+            textSize = 72f
+            gravity = Gravity.CENTER
         }
+        container.addView(stateIcon)
 
-        val qpLabel = TextView(this).apply { text = "Quality (QP, lower = better): ${Settings.getQp(this@MainActivity)}" }
-        val qpEdit = EditText(this).apply {
-            setText(Settings.getQp(this@MainActivity).toString())
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        addSpace(container, 24)
+
+        stateTitle = TextView(this).apply {
+            text = "OpenDisplay"
+            setTextColor(textColor)
+            textSize = 32f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
         }
+        container.addView(stateTitle)
 
-        val hostLabel = TextView(this).apply { text = "Host IP:" }
-        val hostEdit = EditText(this).apply {
-            setText(Settings.getHost(this@MainActivity))
-            inputType = android.text.InputType.TYPE_CLASS_TEXT
+        addSpace(container, 8)
+
+        TextView(this).apply {
+            text = "v$VERSION"
+            setTextColor(textDim)
+            textSize = 14f
+            gravity = Gravity.CENTER
+        }.let { container.addView(it) }
+
+        addSpace(container, 40)
+
+        stateSubtitle = TextView(this).apply {
+            text = "Подключите кабель USB\nк компьютеру"
+            setTextColor(textDim)
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setLineSpacing(1.4f, 1f)
         }
+        container.addView(stateSubtitle)
 
-        val portLabel = TextView(this).apply { text = "Port:" }
-        val portEdit = EditText(this).apply {
-            setText(Settings.getPort(this@MainActivity).toString())
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        addSpace(container, 48)
+
+        btnAction = createButton("Подключить", accentBright) {
+            startStream()
         }
+        container.addView(btnAction)
 
-        layout.addView(fpsLabel)
-        layout.addView(fpsEdit)
-        layout.addView(qpLabel)
-        layout.addView(qpEdit)
-        layout.addView(hostLabel)
-        layout.addView(hostEdit)
-        layout.addView(portLabel)
-        layout.addView(portEdit)
+        addSpace(container, 16)
 
-        AlertDialog.Builder(this)
-            .setTitle("OpenDisplay Settings")
-            .setView(layout)
-            .setPositiveButton("Save") { _, _ ->
-                val fps = fpsEdit.text.toString().toIntOrNull()?.coerceIn(15, 240) ?: 120
-                val qp = qpEdit.text.toString().toIntOrNull()?.coerceIn(0, 51) ?: 12
-                val host = hostEdit.text.toString().trim().ifEmpty { "127.0.0.1" }
-                val port = portEdit.text.toString().toIntOrNull()?.coerceIn(1, 65535) ?: 27183
+        btnSettings = createButton("Настройки", cardColor) {
+            showSettings()
+        }
+        container.addView(btnSettings)
 
-                Settings.setFps(this, fps)
-                Settings.setQp(this, qp)
-                Settings.setHost(this, host)
-                Settings.setPort(this, port)
-
-                fpsLabel.text = "FPS: $fps"
-                qpLabel.text = "Quality (QP, lower = better): $qp"
-                hostLabel.text = "Host IP: $host"
-                portLabel.text = "Port: $port"
-
-                stopStream()
-                startStream()
-            }
-            .setNegativeButton("Cancel") { _, _ -> startStream() }
-            .setOnCancelListener { startStream() }
-            .show()
+        uiLayer.addView(container)
     }
+
+    private fun showConnectingState() {
+        currentState = State.CONNECTING
+        uiLayer.visibility = View.VISIBLE
+        surfaceView.visibility = View.GONE
+        statusBar.visibility = View.GONE
+        uiLayer.removeAllViews()
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        }
+
+        progressBar = ProgressBar(this).apply {
+            isIndeterminate = true
+            indeterminateTintList = android.content.res.ColorStateList.valueOf(accentBright)
+        }
+        val pbParams = LinearLayout.LayoutParams(64, 64).apply { gravity = Gravity.CENTER }
+        container.addView(progressBar, pbParams)
+
+        addSpace(container, 32)
+
+        stateTitle = TextView(this).apply {
+            text = "Подключение..."
+            setTextColor(textColor)
+            textSize = 24f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        container.addView(stateTitle)
+
+        addSpace(container, 12)
+
+        stateSubtitle = TextView(this).apply {
+            text = "Устанавливаем соединение\nс компьютером"
+            setTextColor(textDim)
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setLineSpacing(1.4f, 1f)
+        }
+        container.addView(stateSubtitle)
+
+        addSpace(container, 40)
+
+        btnAction = createButton("Отмена", cardColor) {
+            stopStream()
+            showDisconnectedState()
+        }
+        container.addView(btnAction)
+
+        uiLayer.addView(container)
+    }
+
+    private fun showConnectedState() {
+        currentState = State.CONNECTED
+        uiLayer.visibility = View.VISIBLE
+        surfaceView.visibility = View.GONE
+        statusBar.visibility = View.GONE
+        uiLayer.removeAllViews()
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            setPadding(48, 48, 48, 48)
+        }
+
+        stateIcon = TextView(this).apply {
+            text = "✓"
+            textSize = 72f
+            gravity = Gravity.CENTER
+            setTextColor(greenColor)
+        }
+        container.addView(stateIcon)
+
+        addSpace(container, 24)
+
+        stateTitle = TextView(this).apply {
+            text = "Дисплей подключен"
+            setTextColor(greenColor)
+            textSize = 28f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        container.addView(stateTitle)
+
+        addSpace(container, 8)
+
+        stateSubtitle = TextView(this).apply {
+            text = "${videoW}x$videoH"
+            setTextColor(textDim)
+            textSize = 18f
+            gravity = Gravity.CENTER
+            typeface = Typeface.MONOSPACE
+        }
+        container.addView(stateSubtitle)
+
+        addSpace(container, 48)
+
+        btnAction = createButton("Нажмите для входа", accentBright) {
+            showStreamingState()
+        }
+        container.addView(btnAction)
+
+        addSpace(container, 16)
+
+        createButton("Отключиться", cardColor) {
+            stopStream()
+            showDisconnectedState()
+        }.let { container.addView(it) }
+
+        uiLayer.addView(container)
+    }
+
+    private fun showStreamingState() {
+        currentState = State.STREAMING
+        uiLayer.visibility = View.GONE
+        surfaceView.visibility = View.VISIBLE
+        statusBar.visibility = View.VISIBLE
+        statusText.text = "  ${videoW}x$videoH  | 长按 = настройки"
+
+        // Hide status bar after 3 seconds
+        statusBar.postDelayed({
+            if (currentState == State.STREAMING) statusBar.visibility = View.GONE
+        }, 3000)
+
+        // Tap to show status bar
+        surfaceView.setOnClickListener {
+            statusBar.visibility = View.VISIBLE
+            statusBar.postDelayed({
+                if (currentState == State.STREAMING) statusBar.visibility = View.GONE
+            }, 3000)
+        }
+    }
+
+    private fun showErrorState(message: String) {
+        currentState = State.ERROR
+        uiLayer.visibility = View.VISIBLE
+        surfaceView.visibility = View.GONE
+        statusBar.visibility = View.GONE
+        uiLayer.removeAllViews()
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            setPadding(48, 48, 48, 48)
+        }
+
+        stateIcon = TextView(this).apply {
+            text = "⚠"
+            textSize = 72f
+            gravity = Gravity.CENTER
+            setTextColor(accentBright)
+        }
+        container.addView(stateIcon)
+
+        addSpace(container, 24)
+
+        stateTitle = TextView(this).apply {
+            text = "Ошибка"
+            setTextColor(accentBright)
+            textSize = 28f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        container.addView(stateTitle)
+
+        addSpace(container, 8)
+
+        stateSubtitle = TextView(this).apply {
+            text = message
+            setTextColor(textDim)
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setLineSpacing(1.4f, 1f)
+        }
+        container.addView(stateSubtitle)
+
+        addSpace(container, 40)
+
+        btnAction = createButton("Повторить", accentBright) {
+            startStream()
+        }
+        container.addView(btnAction)
+
+        addSpace(container, 16)
+
+        createButton("Настройки", cardColor) {
+            showSettings()
+        }.let { container.addView(it) }
+
+        uiLayer.addView(container)
+    }
+
+    private fun showSettings() {
+        runOnUiThread {
+            stopStream()
+
+            val layout = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(48, 24, 48, 24)
+                setBackgroundColor(bgColor)
+            }
+
+            // Quality section
+            layout.addView(TextView(this).apply {
+                text = "КАЧЕСТВО"
+                setTextColor(textDim)
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                letterSpacing = 0.2f
+            })
+            addSpace(layout, 12)
+
+            val qualityNames = Settings.QUALITY_PRESETS.keys.toList()
+            val currentQuality = Settings.getQualityName(this)
+            var selectedQuality = currentQuality
+
+            val qualityGroup = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            qualityNames.forEach { name ->
+                val btn = Button(this).apply {
+                    text = name
+                    textSize = 13f
+                    setPadding(16, 8, 16, 8)
+                    setBackground(createChipDrawable(name == currentQuality))
+                    setTextColor(if (name == currentQuality) Color.WHITE else textDim)
+                    setOnClickListener {
+                        selectedQuality = name
+                        for (i in 0 until qualityGroup.childCount) {
+                            val child = qualityGroup.getChildAt(i) as Button
+                            val isSelected = child.text.toString() == name
+                            child.setBackground(createChipDrawable(isSelected))
+                            child.setTextColor(if (isSelected) Color.WHITE else textDim)
+                        }
+                    }
+                }
+                val params = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(4, 0, 4, 0)
+                }
+                qualityGroup.addView(btn, params)
+            }
+            layout.addView(qualityGroup)
+
+            addSpace(layout, 24)
+
+            // FPS section
+            layout.addView(TextView(this).apply {
+                text = "ЧАСТОТА КАДРОВ"
+                setTextColor(textDim)
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                letterSpacing = 0.2f
+            })
+            addSpace(layout, 12)
+
+            val currentFps = Settings.getFps(this)
+            var selectedFps = currentFps
+
+            val fpsGroup = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            Settings.FPS_OPTIONS.forEach { fps ->
+                val btn = Button(this).apply {
+                    text = "$fps"
+                    textSize = 14f
+                    setPadding(20, 8, 20, 8)
+                    setBackground(createChipDrawable(fps == currentFps))
+                    setTextColor(if (fps == currentFps) Color.WHITE else textDim)
+                    setOnClickListener {
+                        selectedFps = fps
+                        for (i in 0 until fpsGroup.childCount) {
+                            val child = fpsGroup.getChildAt(i) as Button
+                            val isSelected = child.text.toString() == "$fps"
+                            child.setBackground(createChipDrawable(isSelected))
+                            child.setTextColor(if (isSelected) Color.WHITE else textDim)
+                        }
+                    }
+                }
+                val params = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(4, 0, 4, 0)
+                }
+                fpsGroup.addView(btn, params)
+            }
+            layout.addView(fpsGroup)
+
+            addSpace(layout, 32)
+
+            // Info
+            layout.addView(TextView(this).apply {
+                text = "Длинное нажатие на видео = настройки"
+                setTextColor(textDim)
+                textSize = 13f
+                gravity = Gravity.CENTER
+            })
+
+            addSpace(layout, 24)
+
+            // Buttons
+            val btnRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+
+            btnRow.addView(Button(this).apply {
+                text = "Отмена"
+                textSize = 15f
+                setPadding(32, 12, 32, 12)
+                setBackground(createChipDrawable(false))
+                setTextColor(textDim)
+                setOnClickListener { showDisconnectedState() }
+            })
+
+            addSpace(btnRow, 16)
+
+            btnRow.addView(Button(this).apply {
+                text = "Сохранить"
+                textSize = 15f
+                setPadding(32, 12, 32, 12)
+                setBackground(createChipDrawable(true))
+                setTextColor(Color.WHITE)
+                setOnClickListener {
+                    Settings.setQualityName(this@MainActivity, selectedQuality)
+                    Settings.setFps(this@MainActivity, selectedFps)
+                    showDisconnectedState()
+                }
+            })
+
+            layout.addView(btnRow)
+
+            // Wrap in ScrollView
+            val scroll = ScrollView(this).apply {
+                addView(layout)
+            }
+
+            uiLayer.visibility = View.VISIBLE
+            surfaceView.visibility = View.GONE
+            statusBar.visibility = View.GONE
+            uiLayer.removeAllViews()
+            uiLayer.addView(scroll)
+        }
+    }
+
+    // --- Streaming ---
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         surfaceReady = true
-        startStream()
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
@@ -142,6 +576,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun startStream() {
         if (running) return
         running = true
+        showConnectingState()
         thread(name = "od-stream") { streamLoop() }
     }
 
@@ -171,7 +606,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 sendCaps(output, 1920, 1080, fps, Proto.CODEC_HEVC)
                 Log.i(TAG, "caps sent, waiting for handshake...")
 
-                // Read handshake
                 val hs = ByteArray(Proto.HS_HEADER_SIZE)
                 input.readFully(hs)
                 val magic = readBe32(hs, 0)
@@ -184,7 +618,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 videoH = readBe16(hs, 10)
                 val hz = readBe16(hs, 12)
                 val codec = hs[6].toInt() and 0xFF
-                Log.i(TAG, "handshake: ${videoW}x$videoH @${hz}Hz codec=$codec")
+                Log.i(TAG, "handshake: ${videoW}x${videoH} @${hz}Hz codec=$codec")
+
+                runOnUiThread { showConnectedState() }
+
+                // Wait for surface to be ready before starting decoder
+                while (running && !surfaceReady) Thread.sleep(50)
 
                 val mime = if (codec == Proto.CODEC_HEVC) MediaFormat.MIMETYPE_VIDEO_HEVC
                            else MediaFormat.MIMETYPE_VIDEO_AVC
@@ -231,6 +670,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "stream error: ${e.message}")
+                if (running) {
+                    runOnUiThread { showErrorState("Не удалось подключиться.\nПроверьте кабель и запущенный хост.") }
+                }
             } finally {
                 try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
                 decoder = null
@@ -259,7 +701,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         out.flush()
     }
 
+    // --- Touch ---
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (currentState != State.STREAMING) return super.onTouchEvent(event)
         val o = out ?: return super.onTouchEvent(event)
         try {
             synchronized(o) {
@@ -305,6 +750,48 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         out.write(payload)
         out.flush()
     }
+
+    // --- Helpers ---
+
+    private fun createButton(text: String, bgColor: Int, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            this.text = text
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            isAllCaps = false
+            setBackground(createRoundDrawable(bgColor, 12f))
+            setPadding(48, 16, 48, 16)
+            setOnClickListener { onClick() }
+            layoutParams = LinearLayout.LayoutParams(
+                320, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { gravity = Gravity.CENTER }
+        }
+    }
+
+    private fun createRoundDrawable(color: Int, radius: Float): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = radius * resources.displayMetrics.density
+        }
+    }
+
+    private fun createChipDrawable(selected: Boolean): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(if (selected) accentBright else cardColor)
+            cornerRadius = 8f * resources.displayMetrics.density
+            setStroke(1, if (selected) accentBright else Color.parseColor("#333355"))
+        }
+    }
+
+    private fun addSpace(parent: LinearLayout, dp: Int) {
+        parent.addView(Space(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp
+            )
+        })
+    }
+
+    // --- Protocol helpers ---
 
     private fun readBe16(b: ByteArray, off: Int): Int =
         ((b[off].toInt() and 0xFF) shl 8) or (b[off + 1].toInt() and 0xFF)
