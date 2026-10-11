@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
     g_logFile = _wfsopen(logPath.c_str(), L"w", _SH_DENYNO);
 
     uint16_t port = OD_PORT;
-    uint32_t qp = 12;
+    uint32_t qp = 18;
     int displayIdx = -1;
     bool useVirtual = true;
 
@@ -297,7 +297,7 @@ int main(int argc, char** argv) {
         if (g_logFile) fclose(g_logFile);
         return 1;
     }
-    log("[+] capturing output %d: %ux%u\n", displayIdx, dda.width(), dda.height());
+    log("[+] capturing output %d: %ux%u @%uHz\n", displayIdx, dda.width(), dda.height(), dda.refreshRate());
 
     const uint32_t encW = dda.width() & ~1u;
     const uint32_t encH = dda.height() & ~1u;
@@ -330,10 +330,12 @@ int main(int argc, char** argv) {
             [&](const OdTouch& t) { input.onTouch(t); },
             [&](const OdKey& k) { input.onKey(k); },
             [&](const OdScroll& s) { input.onScroll(s); },
-            [] { g_running = false; },
+            [] { log("[*] control: client requested stop\n"); g_running = false; },
             cerr);
         if (!cerr.empty() && cerr != "recv() failed or closed")
             log("[!] control: %s\n", cerr.c_str());
+        else if (cerr.empty())
+            log("[*] control: pumpControl returned empty (thread exit)\n");
         g_running = false;
     });
 
@@ -358,6 +360,10 @@ int main(int argc, char** argv) {
     };
 
     int idleBudget = 0;
+    uint64_t encodeTimeTotal = 0;
+    uint64_t ddaTimeouts = 0;
+    uint64_t framesInWindow = 0;
+    ULONGLONG statWindowStart = GetTickCount64();
     while (g_running) {
         ID3D11Texture2D* tex = nullptr;
         std::string aerr;
@@ -367,6 +373,7 @@ int main(int argc, char** argv) {
             break;
         }
         if (r == 0) {
+            ++ddaTimeouts;
             if (++idleBudget > (int)(modeHz * 5)) {
                 Sleep(33);
             }
@@ -376,20 +383,30 @@ int main(int argc, char** argv) {
 
         std::wstring eerr;
         const bool forceIdr = (frameIdx == 0);
+        ULONGLONG encStart = GetTickCount64();
         if (!enc.encode(tex, forceIdr, sink, eerr)) {
             char msg[512];
             wcstombs(msg, eerr.c_str(), sizeof(msg));
             log("[!] encode failed: %s\n", msg);
             break;
         }
+        encodeTimeTotal += GetTickCount64() - encStart;
         dda.releaseFrame();
         ++encodedFrames;
+        ++framesInWindow;
 
-        if (encodedFrames % (uint64_t)modeHz == 0) {
-            const double sec = (GetTickCount64() - t0) / 1000.0;
-            log("[stats] %llu frames, %.1f Mbps\n",
+        ULONGLONG now = GetTickCount64();
+        if (now - statWindowStart >= 1000) {
+            const double sec = (now - t0) / 1000.0;
+            const double winSec = (now - statWindowStart) / 1000.0;
+            log("[stats] %llu frames, %.1f Mbps, fps=%.1f, enc_avg=%.2fms, dda_timeout=%llu\n",
                 (unsigned long long)frameIdx,
-                sec > 0 ? (bytesSent * 8.0 / sec / 1e6) : 0.0);
+                sec > 0 ? (bytesSent * 8.0 / sec / 1e6) : 0.0,
+                winSec > 0 ? (double)framesInWindow / winSec : 0.0,
+                encodedFrames > 0 ? (double)encodeTimeTotal / encodedFrames : 0.0,
+                (unsigned long long)ddaTimeouts);
+            statWindowStart = now;
+            framesInWindow = 0;
         }
     }
 

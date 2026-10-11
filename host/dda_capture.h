@@ -24,6 +24,7 @@ public:
 
     uint32_t width() const { return m_width; }
     uint32_t height() const { return m_height; }
+    uint32_t refreshRate() const { return m_refreshRate; }
     ID3D11Device* device() const { return m_device.Get(); }
 private:
     void drawCursor(const CURSORINFO& ci, int cx, int cy);
@@ -35,6 +36,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_output;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cursorStaging;
     uint32_t m_width = 0, m_height = 0;
+    uint32_t m_refreshRate = 60;
     int m_outputLeft = 0, m_outputTop = 0;
     int m_lastCursorX = -9999, m_lastCursorY = -9999;
     HCURSOR m_lastCursorHandle = nullptr;

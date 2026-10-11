@@ -26,6 +26,8 @@ public:
     bool encode(ID3D11Texture2D* bgraTex, bool forceIdr, PacketSink sink, std::wstring& err);
     void requestSpsPps();
     bool spsPpsSent() const { return m_spsPpsSent; }
+    bool sameAdapter() const { return m_sameAdapter; }
+    bool usingSharedGpu() const { return m_useShared; }
 
 private:
     bool createNvidiaDevice(std::wstring& err);
@@ -48,10 +50,10 @@ private:
     // GPU shared texture (src -> NVIDIA, no CPU copy)
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_shared;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedNv;
-    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> m_sharedKeyedMutex;
     HANDLE m_sharedHandle = nullptr;
     bool m_useShared = false;
     bool m_sameAdapter = false;
+    bool m_useSharedLogged = false;
 
     // Cached video processor views (avoid recreating every frame)
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> m_cachedInViews[4];

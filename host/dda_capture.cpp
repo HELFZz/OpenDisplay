@@ -61,6 +61,16 @@ bool DdaCapture::init(uint32_t outputIndex, std::wstring& err) {
     m_outputLeft = od.DesktopCoordinates.left;
     m_outputTop = od.DesktopCoordinates.top;
 
+    // Query current display mode for refresh rate
+    DXGI_MODE_DESC modeDesc = {};
+    modeDesc.Width = m_width;
+    modeDesc.Height = m_height;
+    modeDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    DXGI_MODE_DESC matched = {};
+    if (SUCCEEDED(output1->FindClosestMatchingMode(&modeDesc, &matched, nullptr)) && matched.RefreshRate.Denominator) {
+        m_refreshRate = matched.RefreshRate.Numerator / matched.RefreshRate.Denominator;
+    }
+
     D3D11_CREATE_DEVICE_FLAG flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
     HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
