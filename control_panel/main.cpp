@@ -1,8 +1,9 @@
-// OpenDisplay Control Panel — Win32 GUI, all-in-one
+// OpenDisplay Control Panel v0.3beta — gray theme, all-in-one
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <stdarg.h>
@@ -14,6 +15,23 @@
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "gdi32.lib")
+
+// Stubs for log() required by virtual_display.cpp
+void log(const char*, ...) {}
+
+// Colors
+#define COL_BG       RGB(32, 33, 36)    // dark gray background
+#define COL_FG       RGB(232, 234, 237) // light text
+#define COL_BTN      RGB(55, 57, 62)    // button bg
+#define COL_BTN_HOT  RGB(70, 72, 78)    // button hover
+#define COL_ACCENT   RGB(0, 122, 204)   // blue accent
+#define COL_GREEN    RGB(52, 168, 83)   // green status
+#define COL_RED      RGB(234, 67, 53)   // red status
+#define COL_YELLOW   RGB(251, 188, 5)   // yellow status
+#define COL_EDIT_BG  RGB(24, 25, 28)   // edit/log bg
+#define COL_BORDER   RGB(60, 62, 68)   // border color
 
 #define IDC_STATUS      1010
 #define IDC_BTN_PLUG    1011
@@ -22,6 +40,11 @@
 #define IDC_BTN_QUIT    1014
 #define IDC_LOG         1015
 #define IDC_HOSTLOG     1016
+#define IDC_TITLE       1017
+#define IDC_LBL_STATUS  1018
+#define IDC_LBL_LOG     1019
+#define IDC_LBL_HOSTLOG 1020
+#define IDC_DOT         1021
 #define IDT_UPDATE      2001
 
 static HINSTANCE g_hInst;
@@ -30,7 +53,12 @@ static bool g_hostRunning = false;
 static VirtualDisplay g_vd;
 static HWND g_hwnd;
 static HWND g_hStatus, g_hBtnPlug, g_hBtnHost, g_hChkAuto, g_hLog, g_hHostLog;
+static HWND g_hDot, g_hTitle, g_hLblStatus, g_hLblLog, g_hLblHostLog;
 static HANDLE g_hostProcess = nullptr;
+
+// Brushes / fonts
+static HBRUSH g_bgBrush, g_btnBrush, g_editBrush, g_borderBrush;
+static HFONT g_fontTitle, g_fontNormal, g_fontSmall, g_fontMono;
 
 static void stopHost();
 static void log(const wchar_t* fmt, ...) {
@@ -53,7 +81,6 @@ static std::wstring getExeDir() {
     return dir.substr(0, dir.find_last_of(L'\\'));
 }
 
-// Read host.log and display in the host log window
 static void updateHostLog() {
     std::wstring logPath = getExeDir() + L"\\..\\..\\host\\bin\\host.log";
     std::ifstream file(logPath);
@@ -68,14 +95,12 @@ static void updateHostLog() {
     std::string content = ss.str();
     file.close();
 
-    // Convert to wide
     int wlen = MultiByteToWideChar(CP_UTF8, 0, content.c_str(), -1, nullptr, 0);
     std::wstring wcontent(wlen, 0);
     MultiByteToWideChar(CP_UTF8, 0, content.c_str(), -1, &wcontent[0], wlen);
-    wcontent.resize(wlen - 1); // remove null
+    wcontent.resize(wlen - 1);
 
     SetWindowTextW(g_hHostLog, wcontent.c_str());
-    // Scroll to bottom
     SendMessageW(g_hHostLog, EM_SETSEL, wcontent.size(), wcontent.size());
     SendMessageW(g_hHostLog, EM_SCROLLCARET, 0, 0);
 }
@@ -132,25 +157,33 @@ static bool isProcessRunning(const wchar_t* name) {
 }
 
 static void updateStatus() {
-    wchar_t text[256];
     bool drv = isDriverInstalled();
     g_hostRunning = isProcessRunning(L"opendisplay-host.exe");
 
+    wchar_t text[256];
     if (!drv) {
-        swprintf_s(text, L"Driver: NOT INSTALLED | Host: %s", g_hostRunning ? L"running" : L"stopped");
+        swprintf_s(text, L"Driver NOT INSTALLED  |  Host: %s", g_hostRunning ? L"running" : L"stopped");
+        SetTextColor(GetDC(g_hDot), COL_RED);
     } else if (g_monitorPlugged) {
-        swprintf_s(text, L"Driver: OK | Monitor: PLUGGED | Host: %s", g_hostRunning ? L"running" : L"stopped");
+        swprintf_s(text, L"Ready  |  Monitor: plugged  |  Host: %s", g_hostRunning ? L"running" : L"stopped");
     } else {
-        swprintf_s(text, L"Driver: OK | Monitor: unplugged | Host: %s", g_hostRunning ? L"running" : L"stopped");
+        swprintf_s(text, L"Driver OK  |  Monitor: unplugged  |  Host: %s", g_hostRunning ? L"running" : L"stopped");
     }
     SetWindowTextW(g_hStatus, text);
+
+    // Update dot color
+    COLORREF dotColor = !drv ? COL_RED : (g_hostRunning ? COL_GREEN : COL_YELLOW);
+    HBRUSH newDot = CreateSolidBrush(dotColor);
+    HBRUSH oldDot = (HBRUSH)SetClassLongPtrW(g_hDot, GCLP_HBRBACKGROUND, (LONG_PTR)newDot);
+    if (oldDot) DeleteObject(oldDot);
+    InvalidateRect(g_hDot, nullptr, TRUE);
+
     SetWindowTextW(g_hBtnPlug, g_monitorPlugged ? L"Unplug Monitor" : L"Plug Monitor");
     SetWindowTextW(g_hBtnHost, g_hostRunning ? L"Stop Host" : L"Start Host");
     SendMessageW(g_hChkAuto, BM_SETCHECK, isAutostart() ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 static void startHost() {
-    // Kill any existing host first
     stopHost();
     Sleep(500);
 
@@ -170,7 +203,6 @@ static void startHost() {
     sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
     sei.lpVerb = L"open";
     sei.lpFile = hostPath.c_str();
-    sei.lpParameters = L"--no-virtual";
     sei.nShow = SW_HIDE;
     if (ShellExecuteExW(&sei)) {
         g_hostProcess = sei.hProcess;
@@ -181,7 +213,6 @@ static void startHost() {
 }
 
 static void stopHost() {
-    // Kill all host processes
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap != INVALID_HANDLE_VALUE) {
         PROCESSENTRY32W pe = {};
@@ -222,7 +253,6 @@ static void toggleMonitor() {
             log(L"[!] Plug-out failed: %hs\n", err.c_str());
         }
     } else {
-        // Try plug-in; if fails (already exists), unplug first then retry
         if (g_vd.plugIn(0, 2, err)) {
             g_monitorPlugged = true;
             log(L"[*] Monitor plugged in\n");
@@ -245,37 +275,127 @@ static void toggleMonitor() {
     updateStatus();
 }
 
+static HBRUSH CreateBtnBrush() { return CreateSolidBrush(COL_BTN); }
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_CREATE:
+    case WM_CREATE: {
         g_hwnd = hwnd;
-        g_hStatus = CreateWindowExW(0, L"STATIC",
-            L"Status: checking...", WS_CHILD | WS_VISIBLE | SS_LEFT,
-            12, 12, 560, 20, hwnd, (HMENU)IDC_STATUS, g_hInst, nullptr);
+
+        // Fonts
+        g_fontTitle = CreateFontW(28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        g_fontNormal = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        g_fontSmall = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        g_fontMono = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
+
+        // Title
+        g_hTitle = CreateWindowExW(0, L"STATIC", L"OpenDisplay",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            20, 16, 300, 36, hwnd, (HMENU)IDC_TITLE, g_hInst, nullptr);
+        SendMessageW(g_hTitle, WM_SETFONT, (WPARAM)g_fontTitle, TRUE);
+
+        // Version label
+        HWND ver = CreateWindowExW(0, L"STATIC", L"v0.3beta",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            320, 22, 100, 20, hwnd, (HMENU)0, g_hInst, nullptr);
+        SendMessageW(ver, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
+        SetTextColor(GetDC(ver), COL_FG);
+
+        // Status dot (colored circle via static)
+        g_hDot = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_BITMAP,
+            20, 60, 12, 12, hwnd, (HMENU)IDC_DOT, g_hInst, nullptr);
+
+        // Status text
+        g_hStatus = CreateWindowExW(0, L"STATIC", L"Status: checking...",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            40, 56, 540, 20, hwnd, (HMENU)IDC_STATUS, g_hInst, nullptr);
+        SendMessageW(g_hStatus, WM_SETFONT, (WPARAM)g_fontNormal, TRUE);
+
+        // Buttons
         g_hBtnPlug = CreateWindowExW(0, L"BUTTON", L"Plug Monitor",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            12, 40, 180, 32, hwnd, (HMENU)IDC_BTN_PLUG, g_hInst, nullptr);
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            20, 90, 180, 40, hwnd, (HMENU)IDC_BTN_PLUG, g_hInst, nullptr);
         g_hBtnHost = CreateWindowExW(0, L"BUTTON", L"Start Host",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            202, 40, 180, 32, hwnd, (HMENU)IDC_BTN_HOST, g_hInst, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"Quit",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            392, 40, 180, 32, hwnd, (HMENU)IDC_BTN_QUIT, g_hInst, nullptr);
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            215, 90, 180, 40, hwnd, (HMENU)IDC_BTN_HOST, g_hInst, nullptr);
+        HWND btnQuit = CreateWindowExW(0, L"BUTTON", L"Quit",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            410, 90, 170, 40, hwnd, (HMENU)IDC_BTN_QUIT, g_hInst, nullptr);
+        SendMessageW(g_hBtnPlug, WM_SETFONT, (WPARAM)g_fontNormal, TRUE);
+        SendMessageW(g_hBtnHost, WM_SETFONT, (WPARAM)g_fontNormal, TRUE);
+        SendMessageW(btnQuit, WM_SETFONT, (WPARAM)g_fontNormal, TRUE);
+
+        // Autostart checkbox
         g_hChkAuto = CreateWindowExW(0, L"BUTTON", L"Start with Windows",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            12, 80, 200, 24, hwnd, (HMENU)IDC_CHK_AUTO, g_hInst, nullptr);
-        g_hLog = CreateWindowExW(0, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            12, 110, 560, 80, hwnd, (HMENU)IDC_LOG, g_hInst, nullptr);
-        CreateWindowExW(0, L"STATIC", L"Host log:",
+            20, 140, 220, 24, hwnd, (HMENU)IDC_CHK_AUTO, g_hInst, nullptr);
+        SendMessageW(g_hChkAuto, WM_SETFONT, (WPARAM)g_fontNormal, TRUE);
+
+        // Log label
+        g_hLblLog = CreateWindowExW(0, L"STATIC", L"Actions",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            12, 195, 100, 16, hwnd, (HMENU)0, g_hInst, nullptr);
-        g_hHostLog = CreateWindowExW(0, L"EDIT", L"",
+            20, 175, 100, 18, hwnd, (HMENU)IDC_LBL_LOG, g_hInst, nullptr);
+        SendMessageW(g_hLblLog, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
+
+        // Action log
+        g_hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            12, 212, 560, 140, hwnd, (HMENU)IDC_HOSTLOG, g_hInst, nullptr);
+            20, 195, 560, 70, hwnd, (HMENU)IDC_LOG, g_hInst, nullptr);
+        SendMessageW(g_hLog, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
+
+        // Host log label
+        g_hLblHostLog = CreateWindowExW(0, L"STATIC", L"Host Log",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            20, 275, 100, 18, hwnd, (HMENU)IDC_LBL_HOSTLOG, g_hInst, nullptr);
+        SendMessageW(g_hLblHostLog, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
+
+        // Host log
+        g_hHostLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            20, 295, 560, 160, hwnd, (HMENU)IDC_HOSTLOG, g_hInst, nullptr);
+        SendMessageW(g_hHostLog, WM_SETFONT, (WPARAM)g_fontMono, TRUE);
+
         updateStatus();
         SetTimer(hwnd, IDT_UPDATE, 1000, nullptr);
         return 0;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        HWND hCtrl = (HWND)lParam;
+
+        if (hCtrl == g_hDot) {
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)GetStockObject(NULL_BRUSH);
+        }
+
+        SetTextColor(hdc, COL_FG);
+        SetBkColor(hdc, COL_BG);
+        return (LRESULT)g_bgBrush;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, COL_FG);
+        SetBkColor(hdc, COL_EDIT_BG);
+        return (LRESULT)g_editBrush;
+    }
+
+    case WM_CTLCOLORBTN: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, COL_FG);
+        SetBkColor(hdc, COL_BTN);
+        return (LRESULT)g_btnBrush;
+    }
 
     case WM_TIMER:
         if (wParam == IDT_UPDATE) {
@@ -304,6 +424,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_UPDATE);
+        if (g_bgBrush) DeleteObject(g_bgBrush);
+        if (g_btnBrush) DeleteObject(g_btnBrush);
+        if (g_editBrush) DeleteObject(g_editBrush);
+        if (g_fontTitle) DeleteObject(g_fontTitle);
+        if (g_fontNormal) DeleteObject(g_fontNormal);
+        if (g_fontSmall) DeleteObject(g_fontSmall);
+        if (g_fontMono) DeleteObject(g_fontMono);
         PostQuitMessage(0);
         return 0;
     }
@@ -320,18 +447,37 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         return 0;
     }
 
+    // Create brushes
+    g_bgBrush = CreateSolidBrush(COL_BG);
+    g_btnBrush = CreateSolidBrush(COL_BTN);
+    g_editBrush = CreateSolidBrush(COL_EDIT_BG);
+    g_borderBrush = CreateSolidBrush(COL_BORDER);
+
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = L"OpenDisplayControlPanel";
+    wc.hbrBackground = g_bgBrush;
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
+
+    // Center window
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int winW = 600, winH = 480;
+    int x = (screenW - winW) / 2;
+    int y = (screenH - winH) / 2;
 
     g_hwnd = CreateWindowExW(0, L"OpenDisplayControlPanel", L"OpenDisplay",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 600, 400,
+        x, y, winW, winH,
         nullptr, nullptr, hInst, nullptr);
+
+    // Remove default background, use dark
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(g_hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);

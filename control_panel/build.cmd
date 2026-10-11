@@ -24,7 +24,7 @@ cl /nologo /std:c++17 /O2 /W3 /EHsc ^
   /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN ^
   main.cpp ..\host\virtual_display.cpp bin\control.res ^
   /Fe:bin\opendisplay-control.exe /Fo:bin\ ^
-  /link d3d11.lib dxgi.lib setupapi.lib advapi32.lib shell32.lib user32.lib ^
+  /link d3d11.lib dxgi.lib setupapi.lib advapi32.lib shell32.lib user32.lib gdi32.lib dwmapi.lib ^
   /SUBSYSTEM:WINDOWS
 
 if errorlevel 1 (

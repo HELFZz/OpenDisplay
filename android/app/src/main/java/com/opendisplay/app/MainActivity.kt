@@ -30,7 +30,7 @@ import kotlin.concurrent.thread
 class MainActivity : Activity(), SurfaceHolder.Callback {
     companion object {
         private const val TAG = "OpenDisplay"
-        private const val VERSION = "0.2beta"
+        private const val VERSION = "0.3beta"
     }
 
     // UI states

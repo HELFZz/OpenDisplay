@@ -37,3 +37,6 @@ third_party/nv-codec-headers/build/
 *.temp
 stdout.txt
 stderr.txt
+
+# Release binaries
+release/

@@ -297,7 +297,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             useVirtual = false;
     }
 
-    log("OpenDisplay host v0.2beta (HEVC, port %u, qp %u)\n", port, qp);
+    log("OpenDisplay host v0.3beta (HEVC, port %u, qp %u)\n", port, qp);
 
     Server server;
     std::string err;
